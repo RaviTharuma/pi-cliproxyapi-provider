@@ -6,6 +6,7 @@
  * - chatgpt-account-id header is omitted when account id is unavailable
  * - provider id(s) are added to CODEX_TOOL_CALL_PROVIDERS for tool-call id handling
  * - model/message api id uses cliproxyapi-codex-responses
+ * - after a started WebSocket stream fails, record SSE fallback for the next hop
  *
  * The patched module is derived at runtime from the installed
  * @earendil-works/pi-ai openai-codex-responses implementation so we track
@@ -99,65 +100,27 @@ function rewriteRelativeImports(source: string, originalDir: string): string {
 	});
 }
 
-function patchWebSocketOnlyTransport(source: string): string {
-	const sessionIdExpression = String.raw`(?:options\?\.sessionId|cacheSessionId)`;
-	const disabledForSession = new RegExp(
-		String.raw`const websocketDisabledForSession\s*=\s*transport !== "sse" && isWebSocketSseFallbackActive\(${sessionIdExpression}\);`,
-	);
-	const retryVariables = /let retriedWebSocketConnectionLimit\s*=\s*false;/;
-	const connectionLimitRetry =
-		/if \(!aborted && connectionLimitBeforeStart && !retriedWebSocketConnectionLimit\) \{\s*retriedWebSocketConnectionLimit = true;\s*continue;\s*\}/;
-	const websocketFailureHandling = new RegExp(
-		String.raw`if \(aborted \|\| \(isCodexNonTransportError\(error\) && !connectionLimitBeforeStart\)\) \{[\s\S]*?recordWebSocketFailure\((${sessionIdExpression}), error\);[\s\S]*?recordWebSocketSseFallback\(\1\);\s*break;`,
-	);
-	const fallbackSessionRecord = "websocketSseFallbackSessions.add(sessionId);";
-	const fallbackActiveRecord = "stats.websocketFallbackActive = true;";
-
-	for (const fragment of [fallbackSessionRecord, fallbackActiveRecord]) {
-		if (!source.includes(fragment)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
-		}
-	}
-	for (const pattern of [disabledForSession, retryVariables, connectionLimitRetry, websocketFailureHandling]) {
-		if (!pattern.test(source)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
-		}
+/**
+ * Restore SSE/HTTP fallback for cliproxyapi-codex-responses.
+ *
+ * Stock pi-ai already falls back to SSE when WebSocket fails before the stream
+ * starts. A successful WSS 101 still sets websocketStarted, so a later stream
+ * error throws without recording fallback and the next hop retries WebSocket.
+ * Record SSE fallback after a started-stream failure so the next attempt uses HTTP.
+ */
+function patchCodexSseFallback(source: string): string {
+	const startedThrow = /if \(websocketStarted\) \{\s*throw error;\s*\}/;
+	if (!startedThrow.test(source)) {
+		throw new Error("openai-codex-responses source no longer supports the SSE fallback patch");
 	}
 
-	return source
-		.replace(disabledForSession, "const websocketDisabledForSession = false;")
-		.replace(
-			retryVariables,
-			`let websocketRetries = 0;
-                const maxWebSocketRetries = Number.isFinite(options?.maxRetries)
-                    ? Math.min(Math.max(0, Math.floor(options.maxRetries)), 5)
-                    : 3;`,
-		)
-		.replace(connectionLimitRetry, "")
-		.replace(
-			websocketFailureHandling,
-			(
-				_match,
-				activeSessionId: string,
-			) => `if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
+	return source.replace(
+		startedThrow,
+		`if (websocketStarted) {
+                            recordWebSocketSseFallback(cacheSessionId);
                             throw error;
-                        }
-                        if (!websocketStarted && websocketRetries < maxWebSocketRetries) {
-                            websocketRetries++;
-                            continue;
-                        }
-                        appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic("provider_transport_failure", error, {
-                            configuredTransport: transport,
-                            fallbackTransport: undefined,
-                            eventsEmitted: websocketStarted,
-                            phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-                            requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-                        }));
-                        recordWebSocketFailure(${activeSessionId}, error);
-                        throw error;`,
-		)
-		.replace(fallbackSessionRecord, "")
-		.replace(fallbackActiveRecord, "stats.websocketFallbackActive = false;");
+                        }`,
+	);
 }
 
 export function patchCodexSource(source: string, providerIds: string[]): string {
@@ -193,9 +156,10 @@ export function patchCodexSource(source: string, providerIds: string[]): string 
 	// Keep assistant message api metadata aligned with the registered custom api id.
 	src = src.replaceAll(`api: "openai-codex-responses"`, `api: ${JSON.stringify(CLIPROXYAPI_CODEX_API)}`);
 
-	// CLIProxyAPI needs a persistent WebSocket transport. Reconnect before the
-	// response starts and surface a failure rather than silently switching to SSE.
-	src = patchWebSocketOnlyTransport(src);
+	// Keep stock pre-stream SSE fallback. After a started WebSocket stream
+	// fails (WSS 101 can succeed while the client still errors), record SSE
+	// fallback so the next hop uses HTTP instead of retrying WebSocket-only.
+	src = patchCodexSseFallback(src);
 
 	// The generated module lives outside the original source map directory.
 	src = src.replace(/^\/\/# sourceMappingURL=.*$/gm, "");
