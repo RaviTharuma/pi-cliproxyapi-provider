@@ -331,33 +331,34 @@ export function writePatchedModuleCache(outputPath: string, source: string, orig
 	writeFileSync(outputPath, rewritten, "utf8");
 }
 
-function patchWebSocketOnlyTransport(source: string): string {
+function patchWebSocketTransport(source: string): string {
 	const sessionIdExpression = String.raw`(?:options\?\.sessionId|cacheSessionId)`;
-	const disabledForSession = new RegExp(
-		String.raw`const websocketDisabledForSession\s*=\s*transport !== "sse" && isWebSocketSseFallbackActive\(${sessionIdExpression}\);`,
-	);
 	const retryVariables = /let retriedWebSocketConnectionLimit\s*=\s*false;/;
 	const connectionLimitRetry =
 		/if \(!aborted && connectionLimitBeforeStart && !retriedWebSocketConnectionLimit\) \{\s*retriedWebSocketConnectionLimit = true;\s*continue;\s*\}/;
 	const websocketFailureHandling = new RegExp(
 		String.raw`if \(aborted \|\| \(isCodexNonTransportError\(error\) && !connectionLimitBeforeStart\)\) \{[\s\S]*?recordWebSocketFailure\((${sessionIdExpression}), error\);[\s\S]*?recordWebSocketSseFallback\(\1\);\s*break;`,
 	);
-	const fallbackSessionRecord = "websocketSseFallbackSessions.add(sessionId);";
-	const fallbackActiveRecord = "stats.websocketFallbackActive = true;";
+	const idleTtlDefinition = "const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;";
+	const transportDefinition = 'const transport = options?.transport || "auto";';
 
-	for (const fragment of [fallbackSessionRecord, fallbackActiveRecord]) {
-		if (!source.includes(fragment)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
-		}
+	if (!source.includes(idleTtlDefinition)) {
+		throw new Error("openai-codex-responses source no longer defines SESSION_WEBSOCKET_CACHE_TTL_MS");
 	}
-	for (const pattern of [disabledForSession, retryVariables, connectionLimitRetry, websocketFailureHandling]) {
+	if (!source.includes(transportDefinition)) {
+		throw new Error("openai-codex-responses source no longer defines transport");
+	}
+	for (const pattern of [retryVariables, connectionLimitRetry, websocketFailureHandling]) {
 		if (!pattern.test(source)) {
-			throw new Error("openai-codex-responses source no longer supports the WebSocket-only transport patch");
+			throw new Error("openai-codex-responses source no longer supports the WebSocket transport patch");
 		}
 	}
 
 	return source
-		.replace(disabledForSession, "const websocketDisabledForSession = false;")
+		.replace(
+			transportDefinition,
+			'const transport = (process.env.CLIPROXYAPI_TRANSPORT || options?.transport || "auto");\n            options = options ? { ...options, transport } : { transport };',
+		)
 		.replace(
 			retryVariables,
 			`let websocketRetries = 0;
@@ -380,16 +381,22 @@ function patchWebSocketOnlyTransport(source: string): string {
                         }
                         appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic("provider_transport_failure", error, {
                             configuredTransport: transport,
-                            fallbackTransport: undefined,
+                            fallbackTransport: websocketStarted ? undefined : "sse",
                             eventsEmitted: websocketStarted,
                             phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
                             requestBytes: new TextEncoder().encode(bodyJson).byteLength,
                         }));
                         recordWebSocketFailure(${activeSessionId}, error);
-                        throw error;`,
+                        if (websocketStarted) {
+                            throw error;
+                        }
+                        recordWebSocketSseFallback(${activeSessionId});
+                        break;`,
 		)
-		.replace(fallbackSessionRecord, "")
-		.replace(fallbackActiveRecord, "stats.websocketFallbackActive = false;");
+		.replace(
+			idleTtlDefinition,
+			'const SESSION_WEBSOCKET_CACHE_TTL_MS = (() => { const raw = Number.parseInt(process.env.CLIPROXYAPI_WS_IDLE_TTL_MS || "", 10); return Number.isFinite(raw) && raw > 0 && raw <= 2147483647 ? raw : 30 * 60 * 1000; })();',
+		);
 }
 
 export function patchCodexSource(source: string, providerIds: string[]): string {
@@ -425,9 +432,9 @@ export function patchCodexSource(source: string, providerIds: string[]): string 
 	// Keep assistant message api metadata aligned with the registered custom api id.
 	src = src.replaceAll(`api: "openai-codex-responses"`, `api: ${JSON.stringify(CLIPROXYAPI_CODEX_API)}`);
 
-	// CLIProxyAPI needs a persistent WebSocket transport. Reconnect before the
-	// response starts and surface a failure rather than silently switching to SSE.
-	src = patchWebSocketOnlyTransport(src);
+	// CLIProxyAPI prefers a persistent WebSocket transport. Reconnect before the
+	// response starts, and gracefully fall back to SSE if retries are exhausted.
+	src = patchWebSocketTransport(src);
 
 	// The generated module lives outside the original source map directory.
 	src = src.replace(/^\/\/# sourceMappingURL=.*$/gm, "");
