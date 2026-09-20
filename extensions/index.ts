@@ -43,9 +43,12 @@ import {
 	decodeRefreshMeta,
 	encodeRefreshMeta,
 	firstNonEmpty,
+	isModelReferencedAsDefault,
 	isUnauthorizedModelsError,
 	loadAuthConnection,
 	loadConfigFile,
+	loadConfiguredDefaultSettings,
+	type MappedModels,
 	type PiProviderModel,
 	resolveConnection,
 	resolveEndpoints,
@@ -70,13 +73,28 @@ class ConfigPersistenceError extends Error {
 interface RefreshResult {
 	modelCount: number;
 	modelsUrl: string;
+	staleCount?: number;
+}
+
+export const DEFAULT_AUTO_RECOVERY_DELAY_MS = 60_000;
+export const MAX_AUTO_RECOVERY_DELAY_MS = 300_000;
+
+export interface RecoverySnapshot {
+	action: () => Promise<unknown>;
+	attempt: number;
+	delayMs: number;
 }
 
 class ModelRefreshCoordinator {
 	private generation = 0;
 	private activeController: AbortController | undefined;
+	private recoveryTimer: NodeJS.Timeout | undefined;
+	private recoveryAttempt = 0;
+	private activeRecovery: RecoverySnapshot | undefined;
+	private stopped = false;
 
 	begin(): { generation: number; signal: AbortSignal } {
+		this.clearRecoveryTimer();
 		this.activeController?.abort();
 		const controller = new AbortController();
 		this.activeController = controller;
@@ -85,7 +103,73 @@ class ModelRefreshCoordinator {
 	}
 
 	isCurrent(generation: number): boolean {
-		return this.generation === generation;
+		return !this.stopped && this.generation === generation;
+	}
+
+	scheduleRecovery(
+		action: () => Promise<unknown>,
+		baseDelayMs = DEFAULT_AUTO_RECOVERY_DELAY_MS,
+		maxDelayMs = MAX_AUTO_RECOVERY_DELAY_MS,
+	): void {
+		if (this.stopped) return;
+		this.clearRecoveryTimer();
+		const delay = Math.min(baseDelayMs * 1.5 ** this.recoveryAttempt, maxDelayMs);
+		this.recoveryAttempt += 1;
+		this.activeRecovery = { action, attempt: this.recoveryAttempt, delayMs: delay };
+
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			if (this.stopped) return;
+			void action().catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+			});
+		}, delay);
+		this.recoveryTimer.unref?.();
+	}
+
+	snapshotRecovery(): RecoverySnapshot | undefined {
+		if (!this.stopped && this.activeRecovery) {
+			return { ...this.activeRecovery };
+		}
+		return undefined;
+	}
+
+	restoreRecovery(snapshot: RecoverySnapshot): void {
+		if (this.stopped || !snapshot) return;
+		this.clearRecoveryTimer();
+		this.recoveryAttempt = snapshot.attempt;
+		this.activeRecovery = snapshot;
+		this.recoveryTimer = setTimeout(() => {
+			this.recoveryTimer = undefined;
+			if (this.stopped) return;
+			void snapshot.action().catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+			});
+		}, snapshot.delayMs);
+		this.recoveryTimer.unref?.();
+	}
+
+	clearRecoveryTimer(): void {
+		if (this.recoveryTimer) {
+			clearTimeout(this.recoveryTimer);
+			this.recoveryTimer = undefined;
+		}
+	}
+
+	clearRecovery(): void {
+		this.clearRecoveryTimer();
+		this.recoveryAttempt = 0;
+		this.activeRecovery = undefined;
+	}
+
+	stop(): void {
+		this.stopped = true;
+		this.clearRecovery();
+		this.activeController?.abort();
+		this.activeController = undefined;
+		this.generation += 1;
 	}
 }
 
@@ -217,6 +301,7 @@ async function configureAndRegister(options: {
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
 	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	onRefreshOutcome?: (loaded: MappedModels) => void;
 }): Promise<RefreshResult> {
 	const {
 		pi,
@@ -230,6 +315,7 @@ async function configureAndRegister(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 
 	const refresh = refreshCoordinator.begin();
@@ -267,10 +353,18 @@ async function configureAndRegister(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	});
 	fastMode.setSupportedModelIds(loaded.fastModelIds);
 
-	return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+	onRefreshOutcome?.(loaded);
+	const staleModels = loaded.models.filter((m) => m.stale);
+
+	return {
+		modelCount: loaded.models.length,
+		modelsUrl: loaded.modelsUrl,
+		staleCount: staleModels.length,
+	};
 }
 
 function createOAuthHandlers(options: {
@@ -283,6 +377,7 @@ function createOAuthHandlers(options: {
 	fastMode: FastModeController;
 	refreshCoordinator: ModelRefreshCoordinator;
 	onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+	onRefreshOutcome?: (loaded: MappedModels) => void;
 }) {
 	const {
 		pi,
@@ -294,6 +389,7 @@ function createOAuthHandlers(options: {
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 
 	return {
@@ -310,6 +406,7 @@ function createOAuthHandlers(options: {
 				});
 
 				callbacks.onProgress?.("Validating credentials via models endpoint...");
+				const previousRecovery = refreshCoordinator.snapshotRecovery();
 				try {
 					const result = await configureAndRegister({
 						pi,
@@ -323,11 +420,15 @@ function createOAuthHandlers(options: {
 						fastMode,
 						refreshCoordinator,
 						onFastModeChange,
+						onRefreshOutcome,
 					});
 
 					logInfo(`login ok: registered ${result.modelCount} models from ${result.modelsUrl}`);
 					return buildOAuthCredentials(baseUrlInput, apiKey);
 				} catch (error) {
+					if (previousRecovery) {
+						refreshCoordinator.restoreRecovery(previousRecovery);
+					}
 					const message = error instanceof Error ? error.message : String(error);
 					logWarn(`login validation failed: ${message}`);
 					if (error instanceof ConfigPersistenceError) {
@@ -384,6 +485,7 @@ function registerProvider(
 		fastMode: FastModeController;
 		refreshCoordinator?: ModelRefreshCoordinator;
 		onFastModeChange?: (enabled: boolean, ctx: ExtensionContext) => Promise<void>;
+		onRefreshOutcome?: (loaded: MappedModels) => void;
 	},
 ): void {
 	const {
@@ -397,6 +499,7 @@ function registerProvider(
 		streamSimple,
 		fastMode,
 		onFastModeChange,
+		onRefreshOutcome,
 	} = options;
 	const refreshCoordinator = options.refreshCoordinator ?? new ModelRefreshCoordinator();
 
@@ -411,6 +514,7 @@ function registerProvider(
 		fastMode,
 		refreshCoordinator,
 		onFastModeChange,
+		onRefreshOutcome,
 	});
 
 	// Replace any previous registration so an earlier ambient apiKey does not linger
@@ -628,10 +732,19 @@ export function registerRefreshCommand(options: {
 						refreshCoordinator,
 					});
 
-					result = { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+					result = {
+						modelCount: loaded.models.length,
+						modelsUrl: loaded.modelsUrl,
+						staleCount: loaded.models.filter((m) => m.stale).length,
+					};
 				}
 
-				ctx.ui.notify(`Refreshed ${result.modelCount} CLIProxyAPI models from ${result.modelsUrl}.`, "info");
+				const staleSuffix =
+					result.staleCount && result.staleCount > 0 ? ` (${result.staleCount} retained from cache)` : "";
+				ctx.ui.notify(
+					`Refreshed ${result.modelCount} CLIProxyAPI models${staleSuffix} from ${result.modelsUrl}.`,
+					"info",
+				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`Failed to refresh CLIProxyAPI models: ${message}`, "error");
@@ -784,6 +897,35 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	fastFooter.register(pi);
 
+	const scheduleActiveRecovery = (): void => {
+		modelRefreshCoordinator.scheduleRecovery(async () => {
+			const activeConn = resolveConnection(agentDir, identity.providerId);
+			if (!activeConn) {
+				modelRefreshCoordinator.clearRecovery();
+				return;
+			}
+			await registerConfiguredProvider(activeConn, { forceRefresh: true });
+		}, DEFAULT_AUTO_RECOVERY_DELAY_MS);
+	};
+
+	const handleRefreshOutcome = (loaded: MappedModels): void => {
+		const staleModels = loaded.models.filter((m) => m.stale);
+		latestStaleModelIds = staleModels.map((m) => m.id);
+
+		if (staleModels.length > 0) {
+			logWarn(
+				`upstream catalog omitted ${staleModels.length} model(s) (${latestStaleModelIds.join(", ")}); retaining cached entries temporarily.`,
+			);
+			if (activeContext) {
+				checkAndNotifyStaleModel(activeContext);
+			}
+			scheduleActiveRecovery();
+		} else {
+			notifiedStaleModelId = undefined;
+			modelRefreshCoordinator.clearRecovery();
+		}
+	};
+
 	// Always register oauth so the provider is visible in /login immediately after install.
 	registerProvider(pi, {
 		providerId: identity.providerId,
@@ -795,12 +937,50 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
 		onFastModeChange: onFastModeChange,
+		onRefreshOutcome: handleRefreshOutcome,
 	});
 	registerTransientNetworkErrorRetry(pi, identity.providerId);
 
+	let activeContext: ExtensionContext | undefined;
+	let latestStaleModelIds: string[] = [];
+	let notifiedStaleModelId: string | undefined;
+
+	const checkAndNotifyStaleModel = (ctx: ExtensionContext): void => {
+		const currentModel = ctx.model;
+		const configured = loadConfiguredDefaultSettings(agentDir);
+		const affectedStaleId = latestStaleModelIds.find(
+			(staleId) =>
+				(currentModel && currentModel.provider === identity.providerId && currentModel.id === staleId) ||
+				isModelReferencedAsDefault(configured, staleId, identity.providerId),
+		);
+
+		if (affectedStaleId) {
+			if (notifiedStaleModelId !== affectedStaleId) {
+				notifiedStaleModelId = affectedStaleId;
+				ctx.ui.notify(
+					`Model '${affectedStaleId}' is temporarily unavailable from upstream (retaining cached entry).`,
+					"warning",
+				);
+			}
+		} else {
+			notifiedStaleModelId = undefined;
+		}
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		activeContext = ctx;
+		checkAndNotifyStaleModel(ctx);
+	});
+	pi.on("session_shutdown", () => {
+		activeContext = undefined;
+		latestStaleModelIds = [];
+		notifiedStaleModelId = undefined;
+		modelRefreshCoordinator.stop();
+	});
+
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
-		currentConnection: NonNullable<ReturnType<typeof resolveConnection>>,
+		currentConnection: { baseUrlInput: string; apiKey: string },
 		options: { forceRefresh?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
@@ -836,18 +1016,37 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				fastMode,
 				refreshCoordinator: modelRefreshCoordinator,
 				onFastModeChange,
+				onRefreshOutcome: handleRefreshOutcome,
 			});
 
-			if (fromCache && !options.forceRefresh) {
-				void registerConfiguredProvider(currentConnection, { forceRefresh: true }).catch((error) => {
-					const message = error instanceof Error ? error.message : String(error);
-					logWarn(`failed to refresh cached models (${message}); keeping the cached model list.`);
-				});
+			if (fromCache) {
+				const cachedStaleModels = loaded.models.filter((m) => m.stale);
+				if (cachedStaleModels.length > 0) {
+					latestStaleModelIds = cachedStaleModels.map((m) => m.id);
+					if (activeContext) {
+						checkAndNotifyStaleModel(activeContext);
+					}
+				}
+				if (!options.forceRefresh) {
+					void registerConfiguredProvider(currentConnection, { forceRefresh: true }).catch((error) => {
+						const message = error instanceof Error ? error.message : String(error);
+						logWarn(`failed to refresh cached models (${message}); keeping the cached model list.`);
+					});
+				}
+			} else {
+				handleRefreshOutcome(loaded);
 			}
 
-			return { modelCount: loaded.models.length, modelsUrl: loaded.modelsUrl };
+			return {
+				modelCount: loaded.models.length,
+				modelsUrl: loaded.modelsUrl,
+				staleCount: loaded.models.filter((m) => m.stale).length,
+			};
 		} catch (error) {
 			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;
+			if (options.forceRefresh) {
+				scheduleActiveRecovery();
+			}
 			throw error;
 		}
 	};
