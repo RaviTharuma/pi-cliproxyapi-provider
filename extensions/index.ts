@@ -18,10 +18,22 @@
  * Non-interactive setup still works via env vars or ~/.pi/agent/cliproxyapi.json.
  */
 
-import type { Api, Model, OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	Model,
+	OAuthCredentials,
+	OAuthLoginCallbacks,
+	SimpleStreamOptions,
+	StreamFunction,
+} from "@earendil-works/pi-ai";
 import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { ProactiveCompactionController } from "./auto-compact.ts";
-import { CLIPROXYAPI_CODEX_API, type CliproxyCodexStreamSimple, loadCliproxyCodexStreams } from "./codex-stream.ts";
+import {
+	applyFastPayloadHook,
+	CLIPROXYAPI_CODEX_API,
+	type CliproxyCodexStreamSimple,
+	loadCliproxyCodexStreams,
+} from "./codex-stream.ts";
 import { FastModeController } from "./fast.ts";
 import { FastFooterController } from "./fast-footer.ts";
 import {
@@ -83,6 +95,45 @@ function logWarn(message: string): void {
 
 function logInfo(message: string): void {
 	console.info(`[pi-cliproxyapi-provider] ${message}`);
+}
+
+const COMPAT_COORDINATOR_KEY = Symbol.for("pi-cliproxyapi-provider.compat-coordinator");
+export const COMPAT_SOURCE_ID = "pi-cliproxyapi-provider-global";
+
+interface CompatRegistrationEntry {
+	instanceId: string;
+	providerId: string;
+	rawStream: CliproxyCodexStreamSimple;
+	rawStreamSimple: CliproxyCodexStreamSimple;
+}
+
+interface CompatCoordinator {
+	stack: CompatRegistrationEntry[];
+}
+
+function getCompatCoordinator(): CompatCoordinator {
+	const globalState = globalThis as unknown as { [COMPAT_COORDINATOR_KEY]?: CompatCoordinator };
+	if (!globalState[COMPAT_COORDINATOR_KEY]) {
+		globalState[COMPAT_COORDINATOR_KEY] = { stack: [] };
+	}
+	return globalState[COMPAT_COORDINATOR_KEY]!;
+}
+
+export function resetCompatCoordinator(): void {
+	const coordinator = getCompatCoordinator();
+	coordinator.stack = [];
+}
+
+function findActiveCompatEntry(
+	stack: CompatRegistrationEntry[],
+	providerId: string,
+): CompatRegistrationEntry | undefined {
+	for (let i = stack.length - 1; i >= 0; i--) {
+		if (stack[i].providerId === providerId) {
+			return stack[i];
+		}
+	}
+	return undefined;
 }
 
 function hasLoginCredential(agentDir: string, providerId: string): boolean {
@@ -627,6 +678,79 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
 		});
 		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
+
+		try {
+			const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+
+			const coordinator = getCompatCoordinator();
+			const instanceId = `${identity.providerId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+			const entry: CompatRegistrationEntry = {
+				instanceId,
+				providerId: identity.providerId,
+				rawStream: streams.rawStream,
+				rawStreamSimple: streams.rawStreamSimple,
+			};
+
+			coordinator.stack.push(entry);
+
+			const dispatchStream: CliproxyCodexStreamSimple = (model, context, options) => {
+				const active = findActiveCompatEntry(coordinator.stack, model.provider);
+				if (!active) {
+					throw new Error(
+						`No active provider stream handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+					);
+				}
+				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
+				if (shouldFast) {
+					return active.rawStream(model, context, {
+						...options,
+						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
+					});
+				}
+				return active.rawStream(model, context, options);
+			};
+
+			const dispatchStreamSimple: CliproxyCodexStreamSimple = (model, context, options) => {
+				const active = findActiveCompatEntry(coordinator.stack, model.provider);
+				if (!active) {
+					throw new Error(
+						`No active provider streamSimple handler registered for provider: ${model.provider} (api: ${CLIPROXYAPI_CODEX_API})`,
+					);
+				}
+				const shouldFast = (options as any)?.serviceTier === "priority" || (options as any)?.fast === true;
+				if (shouldFast) {
+					return active.rawStreamSimple(model, context, {
+						...options,
+						onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, options?.onPayload),
+					});
+				}
+				return active.rawStreamSimple(model, context, options);
+			};
+
+			unregisterApiProviders(COMPAT_SOURCE_ID);
+			registerApiProvider(
+				{
+					api: CLIPROXYAPI_CODEX_API,
+					stream: dispatchStream as StreamFunction<typeof CLIPROXYAPI_CODEX_API>,
+					streamSimple: dispatchStreamSimple as StreamFunction<typeof CLIPROXYAPI_CODEX_API, SimpleStreamOptions>,
+				},
+				COMPAT_SOURCE_ID,
+			);
+
+			pi.on("session_shutdown", () => {
+				const index = coordinator.stack.findIndex((item) => item.instanceId === instanceId);
+				if (index !== -1) {
+					coordinator.stack.splice(index, 1);
+				}
+				if (coordinator.stack.length === 0) {
+					unregisterApiProviders(COMPAT_SOURCE_ID);
+				}
+			});
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			logWarn(`failed to register compat API provider: ${message}`);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`failed to load patched codex protocol: ${message}`);

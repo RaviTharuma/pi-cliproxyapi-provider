@@ -31,6 +31,8 @@ export type CliproxyCodexStreamSimple = (
 export type CliproxyCodexStreams = {
 	streamSimple: CliproxyCodexStreamSimple;
 	stream: CliproxyCodexStreamSimple;
+	rawStreamSimple: CliproxyCodexStreamSimple;
+	rawStream: CliproxyCodexStreamSimple;
 	api: typeof CLIPROXYAPI_CODEX_API;
 };
 
@@ -443,10 +445,13 @@ export async function loadCliproxyCodexStreams(
 	};
 
 	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);
+	const stream = wrapStreamSimpleForFast(adaptedStream, options.shouldUseFast);
 
 	return {
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
-		stream: adaptedStream,
+		stream,
+		rawStreamSimple: adaptedStreamSimple,
+		rawStream: adaptedStream,
 	};
 }
