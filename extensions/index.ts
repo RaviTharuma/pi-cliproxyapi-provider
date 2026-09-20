@@ -677,6 +677,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
 		});
+		proactiveCompaction.setCloseWebSocketSessions(streams.closeOpenAICodexWebSocketSessions);
 		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
 
 		try {

@@ -28,12 +28,15 @@ export type CliproxyCodexStreamSimple = (
 	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
+export type CloseCodexWebSocketSessions = (sessionId?: string) => void;
+
 export type CliproxyCodexStreams = {
 	streamSimple: CliproxyCodexStreamSimple;
 	stream: CliproxyCodexStreamSimple;
 	rawStreamSimple: CliproxyCodexStreamSimple;
 	rawStream: CliproxyCodexStreamSimple;
 	api: typeof CLIPROXYAPI_CODEX_API;
+	closeOpenAICodexWebSocketSessions: CloseCodexWebSocketSessions;
 };
 
 export interface CliproxyCodexStreamOptions {
@@ -428,11 +431,23 @@ export async function loadCliproxyCodexStreams(
 	const mod = (await import(pathToFileURL(outPath).href)) as {
 		streamSimple: CliproxyCodexStreamSimple;
 		stream: CliproxyCodexStreamSimple;
+		closeOpenAICodexWebSocketSessions?: CloseCodexWebSocketSessions;
 	};
 
 	if (typeof mod.streamSimple !== "function" || typeof mod.stream !== "function") {
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
+
+	// Must come from the patched module: its WebSocket cache is a separate Map
+	// from the stock @earendil-works/pi-ai openai-codex-responses instance.
+	const closeOpenAICodexWebSocketSessions =
+		typeof mod.closeOpenAICodexWebSocketSessions === "function"
+			? mod.closeOpenAICodexWebSocketSessions
+			: () => {
+					console.warn(
+						"[pi-cliproxyapi-provider] patched openai-codex-responses module is missing closeOpenAICodexWebSocketSessions export",
+					);
+				};
 
 	const supportsTranscript = supportsTranscriptSource(originalSource);
 	const adaptContext = (context: Context): Context => adaptContextForModule(context, supportsTranscript);
@@ -453,5 +468,6 @@ export async function loadCliproxyCodexStreams(
 		stream,
 		rawStreamSimple: adaptedStreamSimple,
 		rawStream: adaptedStream,
+		closeOpenAICodexWebSocketSessions,
 	};
 }
