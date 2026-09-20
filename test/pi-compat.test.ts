@@ -7,6 +7,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PROACTIVE_COMPACTION_ERROR_PREFIX } from "../extensions/auto-compact.ts";
 import type { CliproxyCodexStreamSimple } from "../extensions/codex-stream.ts";
+import * as codexStream from "../extensions/codex-stream.ts";
 import providerExtension, { COMPAT_SOURCE_ID, resetCompatCoordinator } from "../extensions/index.ts";
 import { AUTH_FILE_NAME } from "../extensions/lib.ts";
 
@@ -539,6 +540,38 @@ describe("pi 0.82.0 compatibility", () => {
 				serviceTier: "priority",
 			} as any);
 			expect(stream2).toBeDefined();
+		});
+	});
+
+	it("closes Codex WebSocket sessions on session_shutdown to allow clean process exit (Issue #26)", async () => {
+		await withTempAgentDir(async () => {
+			const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+			const { pi, handlers } = createPiMock(commands);
+
+			const closeWebSocketSessionsMock = vi.fn();
+			const originalLoadCliproxyCodexStreams = codexStream.loadCliproxyCodexStreams;
+			const spy = vi.spyOn(codexStream, "loadCliproxyCodexStreams").mockImplementation(async (...args) => {
+				const real = await originalLoadCliproxyCodexStreams(...args);
+				return {
+					...real,
+					closeOpenAICodexWebSocketSessions: closeWebSocketSessionsMock,
+				};
+			});
+
+			try {
+				await providerExtension(pi);
+
+				const shutdownHandlers = handlers.get("session_shutdown") ?? [];
+				expect(shutdownHandlers.length).toBeGreaterThan(0);
+
+				for (const handler of shutdownHandlers) {
+					handler({ type: "session_shutdown", reason: "quit" }, {} as ExtensionContext);
+				}
+
+				expect(closeWebSocketSessionsMock).toHaveBeenCalled();
+			} finally {
+				spy.mockRestore();
+			}
 		});
 	});
 });

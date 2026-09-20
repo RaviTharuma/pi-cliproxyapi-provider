@@ -680,6 +680,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		proactiveCompaction.setCloseWebSocketSessions(streams.closeOpenAICodexWebSocketSessions);
 		streamSimple = proactiveCompaction.wrapStreamSimple(streams.streamSimple);
 
+		pi.on("session_shutdown", () => {
+			try {
+				streams.closeOpenAICodexWebSocketSessions();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				logWarn(`failed to close Codex WebSocket sessions on shutdown: ${message}`);
+			}
+		});
+
 		try {
 			const { registerApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
 
