@@ -183,6 +183,32 @@ describe("model mapping helpers", () => {
 		expect(model?.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
 		expect(model?.reasoning).toBe(false);
 	});
+
+	it("derives maxTokens from max_tokens, max_output_tokens, max_completion_tokens or defaults", () => {
+		expect(toPiModel({ id: "m-max-tokens", max_tokens: 128000 })?.maxTokens).toBe(128000);
+		expect(toPiModel({ id: "m-max-output", max_output_tokens: 64000 })?.maxTokens).toBe(64000);
+		expect(toPiModel({ id: "m-max-completion", max_completion_tokens: 32000 })?.maxTokens).toBe(32000);
+		expect(toPiModel({ id: "m-precedence", max_tokens: 128000, max_output_tokens: 64000 })?.maxTokens).toBe(128000);
+		expect(
+			toPiModel({ id: "m-precedence-2", max_output_tokens: 64000, max_completion_tokens: 32000 })?.maxTokens,
+		).toBe(64000);
+		expect(toPiModel({ id: "m-fallback-from-invalid", max_tokens: 0, max_output_tokens: 64000 })?.maxTokens).toBe(
+			64000,
+		);
+		expect(toPiModel({ id: "m-invalid", max_tokens: 0 })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-negative", max_tokens: -100 })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-nan", max_tokens: Number.NaN })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-infinity", max_tokens: Number.POSITIVE_INFINITY })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(toPiModel({ id: "m-default" })?.maxTokens).toBe(DEFAULT_MAX_TOKENS);
+		expect(
+			toPiModel({
+				slug: "claude-sonnet-5",
+				display_name: "Claude Sonnet 5",
+				context_window: 1000000,
+				max_tokens: 128000,
+			})?.maxTokens,
+		).toBe(128000);
+	});
 });
 
 describe("models.dev cost mapping", () => {
