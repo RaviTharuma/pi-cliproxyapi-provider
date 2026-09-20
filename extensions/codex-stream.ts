@@ -150,6 +150,44 @@ export function adaptTranscriptContext(context: Context | { messages?: unknown[]
 	};
 }
 
+/**
+ * Ensure a classic context with top-level systemPrompt/tools is represented as a TranscriptContext.
+ * If the context already contains a system message in context.messages, it is returned untouched.
+ */
+export function ensureTranscriptContext(context: Context | { messages?: unknown[]; [key: string]: unknown }): Context {
+	if (!context || !Array.isArray(context.messages)) return context as Context;
+	const hasSystemMessage = (context.messages as Array<{ role?: string }>).some((m) => m && m.role === "system");
+	if (hasSystemMessage) return context as Context;
+
+	const hasSystemPrompt = typeof context.systemPrompt === "string" && context.systemPrompt.length > 0;
+	const hasTools = Array.isArray(context.tools) && context.tools.length > 0;
+	if (!hasSystemPrompt && !hasTools) return context as Context;
+
+	return {
+		...(context as Record<string, unknown>),
+		messages: [
+			{
+				role: "system",
+				content: context.systemPrompt ?? "",
+				...(hasTools ? { toolsAdded: context.tools } : {}),
+				timestamp: 0,
+			},
+			...context.messages,
+		] as Context["messages"],
+	};
+}
+
+export function supportsTranscriptSource(source: string): boolean {
+	return source.includes("resolveTranscriptTools") || source.includes("resolveTranscript");
+}
+
+export function adaptContextForModule(
+	context: Context | { messages?: unknown[]; [key: string]: unknown },
+	supportsTranscript: boolean,
+): Context {
+	return supportsTranscript ? ensureTranscriptContext(context) : adaptTranscriptContext(context);
+}
+
 export function withPriorityServiceTier(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
@@ -176,11 +214,10 @@ export function wrapStreamSimpleForFast(
 	shouldUseFast?: (model: Model<Api>) => boolean,
 ): CliproxyCodexStreamSimple {
 	return (model, context, streamOptions) => {
-		const adaptedContext = adaptTranscriptContext(context);
 		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, adaptedContext, streamOptions);
+			return streamSimple(model, context, streamOptions);
 		}
-		return streamSimple(model, adaptedContext, {
+		return streamSimple(model, context, {
 			...streamOptions,
 			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
 		});
@@ -335,6 +372,16 @@ function resolveOriginalCodexModulePath(): { path: string; dir: string } {
 	// dist file next to the resolved package entry.
 	const candidates: string[] = [];
 
+	// pi bundled Node CLI exposes pi-ai as a virtual module to
+	// extensions. Resolve its physical nested dependency from the CLI entry so
+	// the source-patching transport can still read the installed implementation.
+	if (process.argv[1]) {
+		const bundledHostModule = resolveCodexModuleFromNodeEntry(process.argv[1]);
+		if (bundledHostModule) {
+			candidates.push(bundledHostModule);
+		}
+	}
+
 	try {
 		const subpath = import.meta.resolve("@earendil-works/pi-ai/api/openai-codex-responses");
 		candidates.push(fileURLToPath(subpath));
@@ -349,16 +396,6 @@ function resolveOriginalCodexModulePath(): { path: string; dir: string } {
 		candidates.push(join(distDir, "openai-codex-responses.js"));
 	} catch {
 		// ignore
-	}
-
-	// pi 0.84.3's bundled Node CLI exposes pi-ai as a virtual module to
-	// extensions. Resolve its physical nested dependency from the CLI entry so
-	// the source-patching transport can still read the installed implementation.
-	if (process.argv[1]) {
-		const bundledHostModule = resolveCodexModuleFromNodeEntry(process.argv[1]);
-		if (bundledHostModule) {
-			candidates.push(bundledHostModule);
-		}
 	}
 
 	for (const path of candidates) {
@@ -395,11 +432,14 @@ export async function loadCliproxyCodexStreams(
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
 
+	const supportsTranscript = supportsTranscriptSource(originalSource);
+	const adaptContext = (context: Context): Context => adaptContextForModule(context, supportsTranscript);
+
 	const adaptedStreamSimple: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.streamSimple(model, adaptTranscriptContext(context), streamOptions);
+		return mod.streamSimple(model, adaptContext(context), streamOptions);
 	};
 	const adaptedStream: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
-		return mod.stream(model, adaptTranscriptContext(context), streamOptions);
+		return mod.stream(model, adaptContext(context), streamOptions);
 	};
 
 	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);
