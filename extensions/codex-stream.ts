@@ -40,6 +40,116 @@ export interface CliproxyCodexStreamOptions {
 
 type PayloadHook = NonNullable<SimpleStreamOptions["onPayload"]>;
 
+interface TranscriptMessage {
+	role?: string;
+	content?: unknown;
+	sections?: Record<string, string | null | undefined>;
+	toolsAdded?: unknown[];
+	toolsRemoved?: Array<{ name: string }>;
+	[key: string]: unknown;
+}
+
+function extractContentText(content: unknown): string {
+	if (typeof content === "string") return content.trim();
+	if (Array.isArray(content)) {
+		return content
+			.filter((b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+			.map((b) => b.text.trim())
+			.filter(Boolean)
+			.join("\n");
+	}
+	return "";
+}
+
+/**
+ * Adapt a pi >=0.86.0 TranscriptContext into a classic Context with top-level systemPrompt and tools.
+ *
+ * In pi >=0.86.0, custom provider stream handlers receive a normalized TranscriptContext where
+ * system prompt sections and tool declarations are encoded into system messages inside context.messages.
+ * Classic openai-codex-responses expects context.systemPrompt and context.tools, and fails when
+ * encountering system messages inside context.messages during token estimation or payload generation.
+ */
+export function adaptTranscriptContext(context: Context | { messages?: unknown[]; [key: string]: unknown }): Context {
+	if (!context || !Array.isArray(context.messages)) {
+		return context as Context;
+	}
+
+	const rawMessages = context.messages as TranscriptMessage[];
+	const hasSystemMessage = rawMessages.some((m) => m && m.role === "system");
+
+	if (!hasSystemMessage) {
+		return context as Context;
+	}
+
+	let leadingText = "";
+	const sections = new Map<string, string>();
+	const toolsMap = new Map<string, unknown>();
+
+	if (Array.isArray(context.tools)) {
+		for (const tool of context.tools) {
+			if (tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string") {
+				toolsMap.set(tool.name, tool);
+			}
+		}
+	}
+
+	const nonSystemMessages: unknown[] = [];
+
+	for (const msg of rawMessages) {
+		if (!msg || typeof msg !== "object") continue;
+
+		if (msg.role === "system") {
+			const text = extractContentText(msg.content);
+			if (text) {
+				leadingText = leadingText ? `${leadingText}\n\n${text}` : text;
+			}
+			if (msg.sections && typeof msg.sections === "object") {
+				for (const [name, sectionText] of Object.entries(msg.sections)) {
+					if (sectionText === null || sectionText === undefined) {
+						sections.delete(name);
+					} else if (typeof sectionText === "string" && sectionText.trim()) {
+						sections.set(name, sectionText.trim());
+					}
+				}
+			}
+			if (Array.isArray(msg.toolsRemoved)) {
+				for (const tool of msg.toolsRemoved) {
+					if (tool && typeof tool.name === "string") {
+						toolsMap.delete(tool.name);
+					}
+				}
+			}
+			if (Array.isArray(msg.toolsAdded)) {
+				for (const tool of msg.toolsAdded) {
+					if (tool && typeof tool === "object" && "name" in tool && typeof tool.name === "string") {
+						toolsMap.set(tool.name, tool);
+					}
+				}
+			}
+		} else {
+			nonSystemMessages.push(msg);
+		}
+	}
+
+	const sectionParts = [...sections.values()];
+	const extractedSystemPrompt = [leadingText, ...sectionParts].filter(Boolean).join("\n\n");
+	const finalSystemPrompt =
+		extractedSystemPrompt || (typeof context.systemPrompt === "string" ? context.systemPrompt : undefined);
+	const finalTools =
+		toolsMap.size > 0
+			? [...toolsMap.values()]
+			: Array.isArray(context.tools) && context.tools.length > 0
+				? context.tools
+				: undefined;
+
+	return {
+		...(context as Record<string, unknown>),
+		systemPrompt: finalSystemPrompt,
+		tools: finalTools as Context["tools"],
+		messages: nonSystemMessages as Context["messages"],
+	};
+}
+
 export function withPriorityServiceTier(payload: unknown): unknown {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 		return payload;
@@ -66,10 +176,11 @@ export function wrapStreamSimpleForFast(
 	shouldUseFast?: (model: Model<Api>) => boolean,
 ): CliproxyCodexStreamSimple {
 	return (model, context, streamOptions) => {
+		const adaptedContext = adaptTranscriptContext(context);
 		if (!shouldUseFast?.(model)) {
-			return streamSimple(model, context, streamOptions);
+			return streamSimple(model, adaptedContext, streamOptions);
 		}
-		return streamSimple(model, context, {
+		return streamSimple(model, adaptedContext, {
 			...streamOptions,
 			onPayload: (payload, payloadModel) => applyFastPayloadHook(payload, payloadModel, streamOptions?.onPayload),
 		});
@@ -284,11 +395,18 @@ export async function loadCliproxyCodexStreams(
 		throw new Error("patched openai-codex-responses module missing streamSimple/stream exports");
 	}
 
-	const streamSimple = wrapStreamSimpleForFast(mod.streamSimple, options.shouldUseFast);
+	const adaptedStreamSimple: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
+		return mod.streamSimple(model, adaptTranscriptContext(context), streamOptions);
+	};
+	const adaptedStream: CliproxyCodexStreamSimple = (model, context, streamOptions) => {
+		return mod.stream(model, adaptTranscriptContext(context), streamOptions);
+	};
+
+	const streamSimple = wrapStreamSimpleForFast(adaptedStreamSimple, options.shouldUseFast);
 
 	return {
 		api: CLIPROXYAPI_CODEX_API,
 		streamSimple,
-		stream: mod.stream,
+		stream: adaptedStream,
 	};
 }
