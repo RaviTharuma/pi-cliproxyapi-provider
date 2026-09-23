@@ -913,9 +913,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		latestStaleModelIds = staleModels.map((m) => m.id);
 
 		if (staleModels.length > 0) {
-			logWarn(
-				`upstream catalog omitted ${staleModels.length} model(s) (${latestStaleModelIds.join(", ")}); retaining cached entries temporarily.`,
-			);
 			if (activeContext) {
 				checkAndNotifyStaleModel(activeContext);
 			}
