@@ -122,6 +122,10 @@ class ModelRefreshCoordinator {
 			if (this.stopped) return;
 			void action().catch((error) => {
 				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("is stale after session replacement or reload")) {
+					this.clearRecovery();
+					return;
+				}
 				logWarn(`auto-recovery refresh failed (${message}); will retry`);
 			});
 		}, delay);
@@ -145,6 +149,10 @@ class ModelRefreshCoordinator {
 			if (this.stopped) return;
 			void snapshot.action().catch((error) => {
 				const message = error instanceof Error ? error.message : String(error);
+				if (message.includes("is stale after session replacement or reload")) {
+					this.clearRecovery();
+					return;
+				}
 				logWarn(`auto-recovery refresh failed (${message}); will retry`);
 			});
 		}, snapshot.delayMs);
@@ -952,24 +960,33 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let notifiedStaleModelId: string | undefined;
 
 	const checkAndNotifyStaleModel = (ctx: ExtensionContext): void => {
-		const currentModel = ctx.model;
-		const configured = loadConfiguredDefaultSettings(agentDir);
-		const affectedStaleId = latestStaleModelIds.find(
-			(staleId) =>
-				(currentModel && currentModel.provider === identity.providerId && currentModel.id === staleId) ||
-				isModelReferencedAsDefault(configured, staleId, identity.providerId),
-		);
+		try {
+			const currentModel = ctx.model;
+			const configured = loadConfiguredDefaultSettings(agentDir);
+			const affectedStaleId = latestStaleModelIds.find(
+				(staleId) =>
+					(currentModel && currentModel.provider === identity.providerId && currentModel.id === staleId) ||
+					isModelReferencedAsDefault(configured, staleId, identity.providerId),
+			);
 
-		if (affectedStaleId) {
-			if (notifiedStaleModelId !== affectedStaleId) {
-				notifiedStaleModelId = affectedStaleId;
-				ctx.ui.notify(
-					`Model '${affectedStaleId}' is temporarily unavailable from upstream (retaining cached entry).`,
-					"warning",
-				);
+			if (affectedStaleId) {
+				if (notifiedStaleModelId !== affectedStaleId) {
+					notifiedStaleModelId = affectedStaleId;
+					ctx.ui.notify(
+						`Model '${affectedStaleId}' is temporarily unavailable from upstream (retaining cached entry).`,
+						"warning",
+					);
+				}
+			} else {
+				notifiedStaleModelId = undefined;
 			}
-		} else {
-			notifiedStaleModelId = undefined;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("is stale after session replacement or reload")) {
+				activeContext = undefined;
+				return;
+			}
+			throw error;
 		}
 	};
 
@@ -1050,6 +1067,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			};
 		} catch (error) {
 			if (!modelRefreshCoordinator.isCurrent(refresh.generation)) return undefined;
+			const message = error instanceof Error ? error.message : String(error);
+			if (message.includes("is stale after session replacement or reload")) {
+				modelRefreshCoordinator.clearRecovery();
+				return undefined;
+			}
 			if (options.forceRefresh) {
 				scheduleActiveRecovery();
 			}
