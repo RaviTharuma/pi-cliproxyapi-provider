@@ -126,7 +126,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, delay);
 		this.recoveryTimer.unref?.();
@@ -153,7 +154,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, snapshot.delayMs);
 		this.recoveryTimer.unref?.();
@@ -793,7 +795,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
-	let streamSimple: CliproxyCodexStreamSimple;
+	let streamSimple: CliproxyCodexStreamSimple = () => {
+		throw new Error(
+			`Codex protocol stream is unavailable for provider: ${identity.providerId} (api: ${CLIPROXYAPI_CODEX_API})`,
+		);
+	};
 	try {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
@@ -885,7 +891,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`failed to load patched codex protocol: ${message}`);
-		return;
 	}
 
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
