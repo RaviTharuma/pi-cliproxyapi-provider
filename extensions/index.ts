@@ -126,7 +126,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, delay);
 		this.recoveryTimer.unref?.();
@@ -153,7 +154,8 @@ class ModelRefreshCoordinator {
 					this.clearRecovery();
 					return;
 				}
-				logWarn(`auto-recovery refresh failed (${message}); will retry`);
+				// Suppressed: logging this into the TUI corrupts the display.
+				// The refresh path already reschedules the next attempt.
 			});
 		}, snapshot.delayMs);
 		this.recoveryTimer.unref?.();
@@ -728,6 +730,7 @@ export function registerRefreshCommand(options: {
 					const refresh = refreshCoordinator?.begin();
 					const { loaded } = await resolveMappedModels(agentDir, connection.baseUrlInput, connection.apiKey, {
 						forceRefresh: true,
+						replaceCache: true,
 						fastMode: fastMode.isEnabled(),
 						signal: refresh?.signal,
 						shouldCommit: refresh ? () => refreshCoordinator?.isCurrent(refresh.generation) ?? true : undefined,
@@ -802,7 +805,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const fastMode = new FastModeController(fastEnabled);
 	const modelRefreshCoordinator = new ModelRefreshCoordinator();
 
-	let streamSimple: CliproxyCodexStreamSimple;
+	let streamSimple: CliproxyCodexStreamSimple = () => {
+		throw new Error(
+			`Codex protocol stream is unavailable for provider: ${identity.providerId} (api: ${CLIPROXYAPI_CODEX_API})`,
+		);
+	};
 	try {
 		const streams = await loadCliproxyCodexStreams([identity.providerId, "cliproxyapi"], {
 			shouldUseFast: (model) => model.provider === identity.providerId && fastMode.isEffectiveFor(model.id),
@@ -894,7 +901,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		logWarn(`failed to load patched codex protocol: ${message}`);
-		return;
 	}
 
 	const fastFooter = new FastFooterController(identity.providerId, fastMode, () =>
@@ -1004,7 +1010,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const connection = resolveConnection(agentDir, identity.providerId);
 	const registerConfiguredProvider = async (
 		currentConnection: { baseUrlInput: string; apiKey: string },
-		options: { forceRefresh?: boolean } = {},
+		options: { forceRefresh?: boolean; replaceCache?: boolean } = {},
 	): Promise<RefreshResult | undefined> => {
 		const refresh = modelRefreshCoordinator.begin();
 		try {
@@ -1014,6 +1020,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				currentConnection.apiKey,
 				{
 					forceRefresh: options.forceRefresh,
+					replaceCache: options.replaceCache,
 					fastMode: fastMode.isEnabled(),
 					signal: refresh.signal,
 					shouldCommit: () => modelRefreshCoordinator.isCurrent(refresh.generation),
@@ -1105,7 +1112,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		streamSimple,
 		fastMode,
 		refreshCoordinator: modelRefreshCoordinator,
-		onRefresh: (currentConnection) => registerConfiguredProvider(currentConnection, { forceRefresh: true }),
+		onRefresh: (currentConnection) =>
+			registerConfiguredProvider(currentConnection, { forceRefresh: true, replaceCache: true }),
 	});
 
 	if (!connection) {

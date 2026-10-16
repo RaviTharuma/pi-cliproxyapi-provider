@@ -12,6 +12,11 @@ export type ThinkingLevelMap = Partial<
 	Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra", string | null>
 >;
 
+// Local subset of pi OpenAIResponsesCompat; only the flags this plugin emits.
+export interface PiProviderModelCompat {
+	supportsMidConvoEffort?: boolean;
+}
+
 export const DEFAULT_PROVIDER_ID = "cliproxyapi";
 export const DEFAULT_PROVIDER_NAME = "CLIProxyAPI";
 export const DEFAULT_BASE_URL = "http://127.0.0.1:8317";
@@ -76,6 +81,7 @@ export interface CodexClientModel {
 	max_completion_tokens?: number;
 	input_modalities?: string[];
 	supported_reasoning_levels?: CodexReasoningLevel[] | string[];
+	supports_reasoning_effort_updates?: boolean;
 	default_service_tier?: string | null;
 	service_tiers?: Array<CodexServiceTier | string>;
 	additional_speed_tiers?: string[];
@@ -113,6 +119,7 @@ export interface PiProviderModel {
 	contextWindow: number;
 	maxTokens: number;
 	thinkingLevelMap?: ThinkingLevelMap;
+	compat?: PiProviderModelCompat;
 	stale?: boolean;
 	lastSeenAt?: number;
 	staleSince?: number;
@@ -513,6 +520,10 @@ export function supportsFastServiceTier(model: CodexClientModel): boolean {
 	return Array.isArray(model.service_tiers) && model.service_tiers.length > 0;
 }
 
+export function supportsReasoningEffortUpdates(model: CodexClientModel): boolean {
+	return model.supports_reasoning_effort_updates === true;
+}
+
 export function toPiModel(
 	model: CodexClientModel,
 	costCatalog?: ModelsDevCostCatalog,
@@ -564,6 +575,7 @@ export function toPiModel(
 		contextWindow,
 		maxTokens,
 		thinkingLevelMap: buildThinkingLevelMap(efforts),
+		...(hasReasoning && supportsReasoningEffortUpdates(model) ? { compat: { supportsMidConvoEffort: true } } : {}),
 	};
 }
 
@@ -1043,7 +1055,8 @@ export function mergeModelsWithExistingCache(
 
 /**
  * Load mapped models from the matching cache, or fetch remotely and update the cache.
- * A forced refresh always bypasses the cache.
+ * A forced refresh bypasses the cache read but still retains models missing from the
+ * fresh catalog. replaceCache writes that catalog as-is after a successful fetch.
  */
 export async function resolveMappedModels(
 	agentDir: string,
@@ -1051,6 +1064,7 @@ export async function resolveMappedModels(
 	apiKey: string,
 	options: {
 		forceRefresh?: boolean;
+		replaceCache?: boolean;
 		fastMode?: boolean;
 		signal?: AbortSignal;
 		shouldCommit?: () => boolean;
@@ -1061,14 +1075,19 @@ export async function resolveMappedModels(
 		options.fastMode === undefined || (cache.fastMode ?? false) === options.fastMode;
 
 	const existingCache = loadModelsCache(agentDir, baseUrlInput);
-	if (!options.forceRefresh) {
+	if (!options.forceRefresh && !options.replaceCache) {
 		if (existingCache && cacheMatchesFastMode(existingCache)) {
 			return { loaded: existingCache, fromCache: true };
 		}
 	}
 
 	const fresh = await loadMappedModels(baseUrlInput, apiKey, options.fastMode, agentDir, options.signal);
-	const { merged } = mergeModelsWithExistingCache(existingCache, fresh, Date.now(), options.staleTtlMs);
+	const { merged } = mergeModelsWithExistingCache(
+		options.replaceCache ? null : existingCache,
+		fresh,
+		Date.now(),
+		options.staleTtlMs,
+	);
 	if (!options.signal?.aborted && (options.shouldCommit?.() ?? true)) {
 		saveModelsCache(agentDir, merged);
 	}
