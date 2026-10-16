@@ -616,9 +616,12 @@ describe("pi 0.82.0 compatibility", () => {
 	it("normalizes OMP system prompt arrays before invoking the Pi Codex stream", async () => {
 		const { wrapStreamSimpleForFast } = await import("../extensions/codex-stream.ts");
 		const eventStream = {} as import("@earendil-works/pi-ai").AssistantMessageEventStream;
-		const delegate = vi.fn(() => eventStream) as unknown as import("../extensions/codex-stream.ts").CliproxyCodexStreamSimple;
+		type CodexStreamSimple = import("../extensions/codex-stream.ts").CliproxyCodexStreamSimple;
+		const delegate = vi.fn<CodexStreamSimple>(() => eventStream);
 		const wrapped = wrapStreamSimpleForFast(delegate);
-		const model = { id: "gpt-5.6-sol", provider: "cliproxyapi" } as import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api>;
+		const model = { id: "gpt-5.6-sol", provider: "cliproxyapi" } as import("@earendil-works/pi-ai").Model<
+			import("@earendil-works/pi-ai").Api
+		>;
 		const context = {
 			systemPrompt: ["first", "second"],
 			messages: [],
@@ -628,5 +631,4 @@ describe("pi 0.82.0 compatibility", () => {
 		const passed = delegate.mock.calls[0][1] as { systemPrompt?: unknown };
 		expect(typeof passed.systemPrompt === "string" || Array.isArray(passed.systemPrompt)).toBe(true);
 	});
-
 });
